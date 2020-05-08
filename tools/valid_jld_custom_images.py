@@ -13,6 +13,8 @@ import argparse
 import os
 import pprint
 import numpy
+import json
+import os.path as osp
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -28,6 +30,8 @@ from tqdm import tqdm
 import _init_paths
 import models
 
+import dataset_jld as dsjld
+
 from config import cfg
 from config import check_config
 from config import update_config
@@ -37,19 +41,14 @@ from core.group import HeatmapParser
 from fp16_utils.fp16util import network_to_half
 from utils.utils import create_logger
 from utils.utils import get_model_summary
-from utils.vis import save_debug_images
-from utils.vis import save_valid_image
 from utils.transforms import resize_align_multi_scale
 from utils.transforms import get_final_preds
 from utils.transforms import get_multi_scale_size
 
 torch.multiprocessing.set_sharing_strategy('file_system')
-
+from loguru import logger as loggur
 
 class ToNumpy(object):
-    """Rescale the image in a sample to a given size.
-    """
-
     def __call__(self, image):
         return numpy.array(image)
 
@@ -154,73 +153,115 @@ def main():
             ToNumpy(),
         ]
     )
-    test_dataset = torchvision.datasets.ImageFolder("/media/jld/DATOS_JLD/git-repos/paper-revista-keypoints/test_images/", transform=transforms_pre)
-    data_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=False
-    )
-    parser = HeatmapParser(cfg)
-    all_preds = []
-    all_scores = []
-
-    pbar = tqdm(total=len(test_dataset)) if cfg.TEST.LOG_PROGRESS else None
-    for i, (images, annos) in enumerate(data_loader):
-        assert 1 == images.size(0), 'Test batch size should be 1'
-
-        image = images[0].cpu().numpy()
-        # size at scale 1.0
-        base_size, center, scale = get_multi_scale_size(
-            image, cfg.DATASET.INPUT_SIZE, 1.0, min(cfg.TEST.SCALE_FACTOR)
-        )
-
-        with torch.no_grad():
-            final_heatmaps = None
-            tags_list = []
-            for idx, s in enumerate(sorted(cfg.TEST.SCALE_FACTOR, reverse=True)):
-                input_size = cfg.DATASET.INPUT_SIZE
-                image_resized, center, scale = resize_align_multi_scale(
-                    image, input_size, s, min(cfg.TEST.SCALE_FACTOR)
-                )
-                image_resized = transforms(image_resized)
-                image_resized = image_resized.unsqueeze(0).cuda()
-
-                outputs, heatmaps, tags = get_multi_stage_outputs(
-                    cfg, model, image_resized, cfg.TEST.FLIP_TEST,
-                    cfg.TEST.PROJECT2IMAGE, base_size
-                )
-
-                final_heatmaps, tags_list = aggregate_results(
-                    cfg, s, final_heatmaps, tags_list, heatmaps, tags
-                )
-
-            final_heatmaps = final_heatmaps / float(len(cfg.TEST.SCALE_FACTOR))
-            tags = torch.cat(tags_list, dim=4)
-            grouped, scores = parser.parse(
-                final_heatmaps, tags, cfg.TEST.ADJUST, cfg.TEST.REFINE
+    # iterate over all datasets
+    datasets_root_path = "/media/jld/DATOS_JLD/datasets"
+    datasets = ["cityscapes", "kitti", "tsinghua"]
+    # testing sets from cityscapes and kitti does not have groundtruth --> processing not required
+    datasplits = [["train", "val"], ["train"], ["train", "val", "test"]]
+    keypoints_output_root_path = "/media/jld/DATOS_JLD/git-repos/paper-revista-keypoints/results"
+    model_name = osp.basename(cfg.TEST.MODEL_FILE).split('.')[0] # Model name + configuration
+    for dsid, dataset in enumerate(datasets):
+        dataset_root_path = osp.join(datasets_root_path, dataset)
+        output_root_path = osp.join(keypoints_output_root_path, dataset)
+        for datasplit in datasplits[dsid]:
+            loggur.info(f"Processing split {datasplit} of {dataset}")
+            input_img_dir = osp.join(dataset_root_path, datasplit)
+            output_kps_json_dir = osp.join(output_root_path, datasplit, model_name)
+            loggur.info(f"Input image dir: {input_img_dir}")
+            loggur.info(f"Output pose JSON dir: {output_kps_json_dir}")
+            # test_dataset = torchvision.datasets.ImageFolder("/media/jld/DATOS_JLD/git-repos/paper-revista-keypoints/test_images/", transform=transforms_pre)
+            test_dataset = dsjld.BaseDataset(input_img_dir,
+                                             output_kps_json_dir,
+                                             transform=transforms_pre)
+            test_dataset.generate_io_samples_pairs()
+            # Stablish weight of keypoints scores (like openpifpaf in https://github.com/vita-epfl/openpifpaf/blob/master/openpifpaf/decoder/annotation.py#L44)
+            n_keypoints = 17
+            kps_score_weights = numpy.ones((17,))
+            kps_score_weights[:3] = 3.0
+            # Normalize weights to sum 1
+            kps_score_weights /= numpy.sum(kps_score_weights)
+            data_loader = torch.utils.data.DataLoader(
+                test_dataset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=False
             )
+            parser = HeatmapParser(cfg)
+            all_preds = []
+            all_scores = []
 
-            final_results = get_final_preds(
-                grouped, center, scale,
-                [final_heatmaps.size(3), final_heatmaps.size(2)]
-            )
+            pbar = tqdm(total=len(test_dataset)) # if cfg.TEST.LOG_PROGRESS else None
+            for i, (img, imgidx) in enumerate(data_loader):
+                assert 1 == img.size(0), 'Test batch size should be 1'
 
-        if cfg.TEST.LOG_PROGRESS:
-            pbar.update()
+                img = img[0].cpu().numpy()
+                # size at scale 1.0
+                base_size, center, scale = get_multi_scale_size(
+                    img, cfg.DATASET.INPUT_SIZE, 1.0, min(cfg.TEST.SCALE_FACTOR)
+                )
 
-        # if i % cfg.PRINT_FREQ == 0:
-        prefix = '{}_{}'.format(os.path.join(final_output_dir, 'result_valid'), i)
-        # logger.info('=> write {}'.format(prefix))
-        save_valid_image(image, final_results, '{}.jpg'.format(prefix), dataset='COCO')
-        # save_debug_images(cfg, image_resized, None, None, outputs, prefix)
+                with torch.no_grad():
+                    final_heatmaps = None
+                    tags_list = []
+                    for idx, s in enumerate(sorted(cfg.TEST.SCALE_FACTOR, reverse=True)):
+                        input_size = cfg.DATASET.INPUT_SIZE
+                        image_resized, center, scale = resize_align_multi_scale(
+                            img, input_size, s, min(cfg.TEST.SCALE_FACTOR)
+                        )
+                        image_resized = transforms(image_resized)
+                        image_resized = image_resized.unsqueeze(0).cuda()
 
-        all_preds.append(final_results)
-        all_scores.append(scores)
+                        outputs, heatmaps, tags = get_multi_stage_outputs(
+                            cfg, model, image_resized, cfg.TEST.FLIP_TEST,
+                            cfg.TEST.PROJECT2IMAGE, base_size
+                        )
 
-    if cfg.TEST.LOG_PROGRESS:
-        pbar.close()
+                        final_heatmaps, tags_list = aggregate_results(
+                            cfg, s, final_heatmaps, tags_list, heatmaps, tags
+                        )
+
+                    final_heatmaps = final_heatmaps / float(len(cfg.TEST.SCALE_FACTOR))
+                    tags = torch.cat(tags_list, dim=4)
+                    grouped, scores = parser.parse(
+                        final_heatmaps, tags, cfg.TEST.ADJUST, cfg.TEST.REFINE
+                    )
+
+                    final_results = get_final_preds(
+                        grouped, center, scale,
+                        [final_heatmaps.size(3), final_heatmaps.size(2)]
+                    )
+
+                # if cfg.TEST.LOG_PROGRESS:
+                pbar.update()
+                # Save all keypoints in a JSON dict
+                final_json_results = []
+                for kps in final_results:
+                    kpsdict = {}
+                    x = kps[:, 0]
+                    y = kps[:, 1]
+                    kps_scores = kps[:, 2]
+                    kpsdict['keypoints'] = kps[:, 0:3].tolist()
+                    # bounding box by means of minmax approach (without zero elements)
+                    xmin = numpy.float64(numpy.min(x[numpy.nonzero(x)]))
+                    xmax = numpy.float64(numpy.max(x))
+                    width = numpy.float64(xmax - xmin)
+                    ymin = numpy.float64(numpy.min(y[numpy.nonzero(y)]))
+                    ymax = numpy.float64(numpy.max(y))
+                    height = numpy.float64(ymax - ymin)
+                    kpsdict['bbox'] = [xmin, ymin, width, height]
+                    # Calculate pose score as a weighted mean of keypoints scores
+                    kpsdict['score'] = numpy.float64(numpy.sum(kps_score_weights * numpy.sort(kps_scores)[::-1]))
+                    final_json_results.append(kpsdict)
+
+                with open(test_dataset.output_json_files_list[imgidx], "w") as f:
+                    json.dump(final_json_results, f)
+
+                all_preds.append(final_results)
+                all_scores.append(scores)
+
+            if cfg.TEST.LOG_PROGRESS:
+                pbar.close()
 """
     name_values, _ = test_dataset.evaluate(
         cfg, all_preds, all_scores, final_output_dir
